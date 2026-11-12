@@ -1,0 +1,36 @@
+# Private research, operational data, and generated reports
+.research/
+data/
+reports/
+
+# Operational databases, checkpoints, and restore workspaces (defense in depth)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+checkpoints/
+checkpoint*/
+.phase*-automation-workspace/
+public-export/
+internal-exports/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dependencies, tooling, logs, and temporary files
+.venv/
+node_modules/
+coverage/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db

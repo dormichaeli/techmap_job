@@ -1,0 +1,59 @@
+name: Daily job collection (manual readiness only)
+
+# Phase 6 deliberately has no schedule trigger. Add a reviewed off-peak cron only
+# after runtime, checkpoint repository, credentials, licensing, and bootstrap approval.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: techmap-job-authoritative-checkpoint
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    environment: checkpoint-production
+    steps:
+      - name: Restrict authoritative runs to main
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Authoritative collection is restricted to refs/heads/main."
+            exit 1
+          fi
+
+      - name: Check out reviewed collector
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up reviewed Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 26.13.1
+
+      - name: Fail closed unless embedded SQLite is safe
+        run: node --disable-warning=ExperimentalWarning scripts/verify-runtime.js
+
+      - name: Run complete regression suite
+        run: npm test
+
+      - name: Restore, collect, checkpoint, verify, and promote
+        env:
+          CHECKPOINT_REPOSITORY_TOKEN: ${{ secrets.CHECKPOINT_REPOSITORY_TOKEN }}
+        run: >-
+          node --disable-warning=ExperimentalWarning scripts/phase6-automation.js
+          --owner dormichaeli
+          --repository techmap_job_checkpoints
+          --branch main
+          --token-env CHECKPOINT_REPOSITORY_TOKEN
+          --workspace "${{ runner.temp }}/techmap-job-automation"
+          --cohort-policy first_cloud_v1
+          --limit 5
+          --concurrency 2
+          --cleanup true
