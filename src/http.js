@@ -1,5 +1,7 @@
 const DEFAULT_USER_AGENT = "israel-job-discovery-poc/0.1 (personal research; public job boards only)";
 
+let attemptBudget = null;
+
 export class HttpError extends Error {
   constructor(message, { status = 0, retryable = false, url = "" } = {}) {
     super(message);
@@ -8,6 +10,35 @@ export class HttpError extends Error {
     this.retryable = retryable;
     this.url = url;
   }
+}
+
+export function configureHttpAttemptBudget(maxAttempts) {
+  const parsed = Number(maxAttempts);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`HTTP attempt budget must be a positive integer, received: ${maxAttempts}`);
+  }
+  attemptBudget = { max_attempts: parsed, attempts: 0, blocked_attempts: 0 };
+  return httpAttemptBudgetSnapshot();
+}
+
+export function httpAttemptBudgetSnapshot() {
+  return attemptBudget ? { ...attemptBudget } : null;
+}
+
+export function clearHttpAttemptBudget() {
+  attemptBudget = null;
+}
+
+function consumeHttpAttempt(url) {
+  if (!attemptBudget) return;
+  if (attemptBudget.attempts >= attemptBudget.max_attempts) {
+    attemptBudget.blocked_attempts += 1;
+    throw new HttpError(`HTTP attempt budget exhausted before requesting ${url}`, {
+      retryable: false,
+      url,
+    });
+  }
+  attemptBudget.attempts += 1;
 }
 function retryDelay(response, attempt, baseMs) {
   const retryAfter = response?.headers?.get("retry-after");
@@ -28,6 +59,7 @@ export async function request(url, {
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     let response;
     try {
+      consumeHttpAttempt(url);
       response = await fetch(url, {
         method,
         body,

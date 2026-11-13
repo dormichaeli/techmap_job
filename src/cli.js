@@ -1,9 +1,16 @@
+import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { readCsv, writeCsv } from "./csv.js";
 import { collectCompany } from "./adapters.js";
 import { companyIdFor, normalizeCompanyName } from "./company.js";
 import { buildCandidateDataset } from "./discovery.js";
-import { mapBounded, request } from "./http.js";
+import {
+  clearHttpAttemptBudget,
+  configureHttpAttemptBudget,
+  httpAttemptBudgetSnapshot,
+  mapBounded,
+  request,
+} from "./http.js";
 import { normalizeJob } from "./scoring.js";
 import {
   openStore, beginRun, recordSourceObservation, applySuccessfulObservation, finishRun,
@@ -81,6 +88,9 @@ async function collect(options) {
   const companies = availableCompanies.slice(0, limit);
   const databasePath = resolve(options.db ?? DB_PATH);
   const exportDirectory = resolve(options.export_dir ?? "data");
+  if (options.max_http_attempts !== undefined) {
+    configureHttpAttemptBudget(numberOption(options.max_http_attempts));
+  }
   const db = openStore(databasePath);
   const startedAt = options.observed_at ?? new Date().toISOString();
   const runId = beginRun(db, startedAt);
@@ -112,7 +122,17 @@ async function collect(options) {
     finishRun(db, runId, "interrupted", options.observed_at ?? new Date().toISOString());
     throw error;
   } finally {
-    db.close();
+    try {
+      if (options.http_metrics_file) {
+        writeFileSync(resolve(options.http_metrics_file), `${JSON.stringify(httpAttemptBudgetSnapshot(), null, 2)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      }
+    } finally {
+      clearHttpAttemptBudget();
+      db.close();
+    }
   }
 }
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { runCheckpointAutomation } from "../src/automation.js";
 import {
   COLLECTION_COHORT_FIELDS,
+  FIRST_CLOUD_MAX_HTTP_ATTEMPTS,
   FIRST_CLOUD_MAX_SOURCES,
   FIRST_CLOUD_POLICY,
   selectCollectionCohort,
@@ -63,6 +64,7 @@ try {
         cohortDatabase.close();
       }
       const companies = join(workspacePath, "private-collection-cohort.csv");
+      const httpMetrics = join(workspacePath, "private-http-attempt-metrics.json");
       await writeCsv(companies, cohort, COLLECTION_COHORT_FIELDS);
       const collection = spawnSync(process.execPath, [
         "--disable-warning=ExperimentalWarning",
@@ -75,9 +77,17 @@ try {
         "--export-dir", resolve(workspacePath, "internal-exports"),
         "--cohort", cohortPolicy,
         "--discovery-kind", "incremental",
+        "--max-http-attempts", FIRST_CLOUD_MAX_HTTP_ATTEMPTS,
+        "--http-metrics-file", httpMetrics,
       ], { encoding: "utf8", timeout: 45 * 60 * 1000 });
       if (collection.status !== 0) {
         throw new Error(`Bounded collector failed with status ${collection.status}; captured output was withheld from public logs`);
+      }
+      const attemptMetrics = JSON.parse(readFileSync(httpMetrics, "utf8"));
+      if (attemptMetrics.max_attempts !== FIRST_CLOUD_MAX_HTTP_ATTEMPTS
+        || attemptMetrics.attempts > FIRST_CLOUD_MAX_HTTP_ATTEMPTS
+        || attemptMetrics.blocked_attempts !== 0) {
+        throw new Error("Bounded collector violated the first-cloud HTTP attempt policy");
       }
       return {
         cohort_policy: cohortPolicy,
@@ -86,6 +96,8 @@ try {
         source_ids_sha256: createHash("sha256")
           .update(cohort.map((row) => row.company_source_id).join("\n"))
           .digest("hex"),
+        http_attempts: attemptMetrics.attempts,
+        max_http_attempts: attemptMetrics.max_attempts,
       };
     },
     onStage(stage) {
@@ -97,6 +109,8 @@ try {
     cohort_policy: result.collection.cohort_policy,
     cohort_fingerprint: result.collection.source_ids_sha256,
     source_count: result.collection.limit,
+    http_attempts: result.collection.http_attempts,
+    max_http_attempts: result.collection.max_http_attempts,
     runtime: result.runtime,
   }, null, 2));
 } catch (error) {

@@ -129,6 +129,7 @@ test("manual workflow has no schedule, no public data dependency, and fixed auth
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /--cohort-policy first_cloud_v1/);
   assert.match(workflow, /--limit 5/);
+  assert.match(workflow, /--concurrency 2/);
   assert.match(workflow, /actions\/checkout@d23441a48e516b6c34aea4fa41551a30e30af803/);
   assert.match(workflow, /actions\/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38/);
 });
