@@ -1,5 +1,16 @@
-import { randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  createReadStream,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { request as httpsRequest } from "node:https";
 import { join, resolve } from "node:path";
 import {
   CHECKPOINT_DATABASE_FILE,
@@ -15,6 +26,10 @@ import {
 import { RemoteStorageError } from "./remote-checkpoint.js";
 
 const API_VERSION = "2026-03-10";
+const DEFAULT_UPLOAD_CONNECTION_TIMEOUT_MS = 30_000;
+const DEFAULT_UPLOAD_RESPONSE_TIMEOUT_MS = 120_000;
+const DEFAULT_UPLOAD_IDLE_TIMEOUT_MS = 60_000;
+const MAX_UPLOAD_RESPONSE_BYTES = 1024 * 1024;
 
 function encodePath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
@@ -22,6 +37,182 @@ function encodePath(path) {
 
 function tagFor(checkpointId) {
   return `techmap-checkpoint-${checkpointId}`;
+}
+
+function requestDetails(url, method, response = null, error = null) {
+  const target = new URL(url);
+  const cause = error?.cause ?? error;
+  return {
+    method,
+    hostname: target.hostname,
+    path: target.pathname,
+    status: response?.status ?? response?.statusCode ?? null,
+    github_request_id: response?.headers?.get?.("x-github-request-id")
+      ?? response?.headers?.["x-github-request-id"]
+      ?? null,
+    transport_error_name: error?.name ?? null,
+    cause_code: cause?.code ?? null,
+    cause_errno: cause?.errno ?? null,
+    cause_syscall: cause?.syscall ?? null,
+  };
+}
+
+function httpErrorCode(status, remaining, { upload = false } = {}) {
+  if (status === 401) return "AUTHENTICATION_FAILED";
+  if (status === 403 && remaining === "0") return "RATE_LIMITED";
+  if (status === 403) return "PERMISSION_DENIED";
+  if (status === 404) return "REMOTE_NOT_FOUND";
+  if (status === 409) return "CONCURRENT_PUBLICATION";
+  if (status === 413 || status === 422) return "STORAGE_QUOTA_OR_VALIDATION";
+  if (status === 429) return "RATE_LIMITED";
+  if (upload && status === 502) return "UPLOAD_HTTP_BAD_GATEWAY";
+  return "REMOTE_REQUEST_FAILED";
+}
+
+function uploadTimeout(url, phase) {
+  return new RemoteStorageError(
+    "UPLOAD_TIMEOUT",
+    `GitHub Release asset upload timed out during ${phase}`,
+    { ...requestDetails(url, "POST"), timeout_phase: phase },
+  );
+}
+
+function uploadTransportError(url, error) {
+  return new RemoteStorageError(
+    "UPLOAD_TRANSPORT_FAILED",
+    "GitHub Release asset upload transport failed",
+    requestDetails(url, "POST", null, error),
+  );
+}
+
+export function streamReleaseAssetUpload({
+  url,
+  filePath,
+  token,
+  contentType,
+  requestImpl = httpsRequest,
+  createReadStreamImpl = createReadStream,
+  connectionTimeoutMs = DEFAULT_UPLOAD_CONNECTION_TIMEOUT_MS,
+  responseTimeoutMs = DEFAULT_UPLOAD_RESPONSE_TIMEOUT_MS,
+  idleTimeoutMs = DEFAULT_UPLOAD_IDLE_TIMEOUT_MS,
+  allowInsecureHttp = false,
+}) {
+  const target = new URL(url);
+  if (target.protocol !== "https:" && !(allowInsecureHttp && target.protocol === "http:")) {
+    throw new RemoteStorageError("UPLOAD_URL_INVALID", "Release asset upload URL must use HTTPS");
+  }
+  const size = statSync(filePath).size;
+  return new Promise((resolve, reject) => {
+    let source = null;
+    let request = null;
+    let response = null;
+    let connectionTimer = null;
+    let responseTimer = null;
+    let settled = false;
+
+    const clearTimers = () => {
+      clearTimeout(connectionTimer);
+      clearTimeout(responseTimer);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      source?.unpipe?.(request);
+      source?.destroy?.();
+      response?.destroy?.();
+      request?.destroy?.();
+      reject(error);
+    };
+    const succeed = (asset) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      resolve(asset);
+    };
+
+    try {
+      request = requestImpl(target, {
+        method: "POST",
+        agent: false,
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "content-type": contentType,
+          "content-length": String(size),
+          "x-github-api-version": API_VERSION,
+          "user-agent": "techmap-job-checkpoint/0.1",
+        },
+      }, (incoming) => {
+        response = incoming;
+        clearTimeout(responseTimer);
+        const chunks = [];
+        let responseBytes = 0;
+        incoming.on("data", (chunk) => {
+          responseBytes += chunk.length;
+          if (responseBytes > MAX_UPLOAD_RESPONSE_BYTES) {
+            fail(new RemoteStorageError(
+              "UPLOAD_RESPONSE_INVALID",
+              "GitHub Release asset upload response exceeded the safe size limit",
+              requestDetails(url, "POST", incoming),
+            ));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        incoming.once("error", (error) => fail(uploadTransportError(url, error)));
+        incoming.once("end", () => {
+          if (settled) return;
+          const status = incoming.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            const remaining = incoming.headers["x-ratelimit-remaining"] ?? null;
+            fail(new RemoteStorageError(
+              httpErrorCode(status, remaining, { upload: true }),
+              `GitHub Release asset upload returned ${status}`,
+              requestDetails(url, "POST", incoming),
+            ));
+            return;
+          }
+          let asset;
+          try {
+            asset = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            fail(new RemoteStorageError(
+              "UPLOAD_RESPONSE_INVALID",
+              "GitHub Release asset upload returned invalid JSON",
+              requestDetails(url, "POST", incoming),
+            ));
+            return;
+          }
+          succeed(asset);
+        });
+      });
+    } catch (error) {
+      fail(uploadTransportError(url, error));
+      return;
+    }
+
+    connectionTimer = setTimeout(() => fail(uploadTimeout(url, "connection")), connectionTimeoutMs);
+    request.once("socket", (socket) => {
+      const connected = () => clearTimeout(connectionTimer);
+      if (!socket.connecting) connected();
+      else socket.once(target.protocol === "https:" ? "secureConnect" : "connect", connected);
+    });
+    request.setTimeout(idleTimeoutMs, () => fail(uploadTimeout(url, "idle")));
+    request.once("finish", () => {
+      clearTimeout(connectionTimer);
+      if (!response) responseTimer = setTimeout(() => fail(uploadTimeout(url, "response")), responseTimeoutMs);
+    });
+    request.once("error", (error) => fail(uploadTransportError(url, error)));
+
+    try {
+      source = createReadStreamImpl(filePath);
+      source.once("error", (error) => fail(uploadTransportError(url, error)));
+      source.pipe(request);
+    } catch (error) {
+      fail(uploadTransportError(url, error));
+    }
+  });
 }
 
 export class GitHubReleaseCheckpointStorage {
@@ -33,6 +224,11 @@ export class GitHubReleaseCheckpointStorage {
     pointerPath = ".techmap-job/latest-checkpoint.json",
     fetchImpl = globalThis.fetch,
     apiBase = "https://api.github.com",
+    streamUploadImpl = streamReleaseAssetUpload,
+    uploadRequestImpl = httpsRequest,
+    uploadConnectionTimeoutMs = DEFAULT_UPLOAD_CONNECTION_TIMEOUT_MS,
+    uploadResponseTimeoutMs = DEFAULT_UPLOAD_RESPONSE_TIMEOUT_MS,
+    uploadIdleTimeoutMs = DEFAULT_UPLOAD_IDLE_TIMEOUT_MS,
   }) {
     if (!owner || !repository) throw new RemoteStorageError("STORAGE_CONFIGURATION_INVALID", "GitHub owner and repository are required");
     if (!token) throw new RemoteStorageError("CREDENTIALS_MISSING", "GitHub checkpoint token is missing");
@@ -43,6 +239,11 @@ export class GitHubReleaseCheckpointStorage {
     this.pointerPath = pointerPath;
     this.fetch = fetchImpl;
     this.apiBase = apiBase.replace(/\/$/, "");
+    this.streamUpload = streamUploadImpl;
+    this.uploadRequest = uploadRequestImpl;
+    this.uploadConnectionTimeoutMs = uploadConnectionTimeoutMs;
+    this.uploadResponseTimeoutMs = uploadResponseTimeoutMs;
+    this.uploadIdleTimeoutMs = uploadIdleTimeoutMs;
   }
 
   endpoint(path) {
@@ -64,21 +265,19 @@ export class GitHubReleaseCheckpointStorage {
         body: body === undefined || raw ? body : JSON.stringify(body),
       });
     } catch (error) {
-      throw new RemoteStorageError("REMOTE_REQUEST_FAILED", `GitHub request failed: ${error.message}`);
+      throw new RemoteStorageError(
+        "REMOTE_REQUEST_FAILED",
+        "GitHub request transport failed",
+        requestDetails(url, method, null, error),
+      );
     }
     if (allow404 && response.status === 404) return null;
     if (!response.ok) {
       const remaining = response.headers?.get?.("x-ratelimit-remaining");
       const reset = response.headers?.get?.("x-ratelimit-reset");
-      const code = response.status === 401 ? "AUTHENTICATION_FAILED"
-        : response.status === 403 && remaining === "0" ? "RATE_LIMITED"
-          : response.status === 403 ? "PERMISSION_DENIED"
-            : response.status === 404 ? "REMOTE_NOT_FOUND"
-              : response.status === 409 ? "CONCURRENT_PUBLICATION"
-                : response.status === 413 || response.status === 422 ? "STORAGE_QUOTA_OR_VALIDATION"
-                  : response.status === 429 ? "RATE_LIMITED" : "REMOTE_REQUEST_FAILED";
+      const code = httpErrorCode(response.status, remaining);
       throw new RemoteStorageError(code, `GitHub API ${method} ${new URL(url).pathname} returned ${response.status}`, {
-        status: response.status,
+        ...requestDetails(url, method, response),
         rate_limit_remaining: remaining,
         rate_limit_reset: reset,
       });
@@ -185,14 +384,112 @@ export class GitHubReleaseCheckpointStorage {
     throw new RemoteStorageError("TRUSTED_CHECKPOINT_MISSING", `No valid GitHub Release checkpoint found after ${pointerFailure}`);
   }
 
-  async uploadAsset(uploadUrl, name, bytes, contentType) {
-    const base = uploadUrl.replace(/\{.*$/, "");
-    return this.request(`${base}?name=${encodeURIComponent(name)}`, {
-      method: "POST",
-      headers: { "content-type": contentType },
-      body: bytes,
-      raw: true,
-    });
+  uploadOutcomeUnknown(name, failure, assetState, extra = {}) {
+    return new RemoteStorageError(
+      "UPLOAD_OUTCOME_UNKNOWN",
+      `GitHub Release asset upload outcome is unresolved for ${name}`,
+      {
+        failure_code: failure.code ?? "UNKNOWN",
+        failure_details: failure.details ?? {},
+        asset_state: assetState,
+        ...extra,
+      },
+    );
+  }
+
+  async verifyRemoteAsset(asset, { name, size, sha256 }, failure = null) {
+    if (asset.state !== "uploaded") {
+      throw this.uploadOutcomeUnknown(name, failure ?? new RemoteStorageError("EXISTING_ASSET_UNVERIFIED", "Existing asset is not complete"), asset.state ?? "unknown", {
+        asset_id: asset.id ?? null,
+        observed_size: asset.size ?? null,
+      });
+    }
+    if (asset.size !== size) {
+      throw this.uploadOutcomeUnknown(name, failure ?? new RemoteStorageError("EXISTING_ASSET_UNVERIFIED", "Existing asset size differs"), "partial", {
+        asset_id: asset.id ?? null,
+        expected_size: size,
+        observed_size: asset.size ?? null,
+      });
+    }
+    const expectedDigest = `sha256:${sha256}`;
+    if (asset.digest !== expectedDigest) {
+      throw new RemoteStorageError("UPLOAD_CHECKSUM_MISMATCH", `GitHub Release asset digest differs for ${name}`, {
+        asset_id: asset.id ?? null,
+        expected_digest: expectedDigest,
+        observed_digest: asset.digest ?? null,
+        failure_code: failure?.code ?? null,
+      });
+    }
+    let bytes;
+    try {
+      bytes = await this.request(asset.url, { raw: true });
+    } catch (error) {
+      throw this.uploadOutcomeUnknown(name, failure ?? error, "verification_failed", {
+        asset_id: asset.id ?? null,
+        verification_error_code: error.code ?? "UNKNOWN",
+      });
+    }
+    const downloadedSha256 = createHash("sha256").update(bytes).digest("hex");
+    if (bytes.length !== size || downloadedSha256 !== sha256) {
+      throw new RemoteStorageError("UPLOAD_CHECKSUM_MISMATCH", `Downloaded GitHub Release asset differs for ${name}`, {
+        asset_id: asset.id ?? null,
+        expected_size: size,
+        observed_size: bytes.length,
+        expected_sha256: sha256,
+        observed_sha256: downloadedSha256,
+        failure_code: failure?.code ?? null,
+      });
+    }
+    return { asset, reconciled: Boolean(failure), independently_verified: true };
+  }
+
+  async reconcileUploadFailure(release, expected, failure) {
+    let assets;
+    try {
+      assets = await this.request(this.endpoint(`/releases/${release.id}/assets?per_page=100`));
+    } catch (error) {
+      throw this.uploadOutcomeUnknown(expected.name, failure, "reconciliation_failed", {
+        reconciliation_error_code: error.code ?? "UNKNOWN",
+      });
+    }
+    const matches = assets.filter((asset) => asset.name === expected.name);
+    if (matches.length === 0) throw this.uploadOutcomeUnknown(expected.name, failure, "absent");
+    if (matches.length !== 1) {
+      throw this.uploadOutcomeUnknown(expected.name, failure, "ambiguous", { matching_assets: matches.length });
+    }
+    return this.verifyRemoteAsset(matches[0], expected, failure);
+  }
+
+  async uploadAsset(release, { name, path, contentType, size, sha256 }) {
+    const base = release.upload_url.replace(/\{.*$/, "");
+    const url = `${base}?name=${encodeURIComponent(name)}`;
+    try {
+      const asset = await this.streamUpload({
+        url,
+        filePath: path,
+        token: this.token,
+        contentType,
+        requestImpl: this.uploadRequest,
+        connectionTimeoutMs: this.uploadConnectionTimeoutMs,
+        responseTimeoutMs: this.uploadResponseTimeoutMs,
+        idleTimeoutMs: this.uploadIdleTimeoutMs,
+      });
+      return { asset, reconciled: false, independently_verified: false };
+    } catch (error) {
+      if (error.code === "AUTHENTICATION_FAILED" || error.code === "PERMISSION_DENIED" || error.code === "RATE_LIMITED") throw error;
+      return this.reconcileUploadFailure(release, { name, size, sha256 }, error);
+    }
+  }
+
+  async ensureDraftAsset(release, expected) {
+    const matches = (release.assets ?? []).filter((asset) => asset.name === expected.name);
+    if (matches.length > 1) {
+      throw this.uploadOutcomeUnknown(expected.name, new RemoteStorageError("EXISTING_ASSET_AMBIGUOUS", "Multiple existing assets share the expected name"), "ambiguous", {
+        matching_assets: matches.length,
+      });
+    }
+    if (matches.length === 1) return this.verifyRemoteAsset(matches[0], expected);
+    return this.uploadAsset(release, expected);
   }
 
   async stageCheckpoint(checkpointPath) {
@@ -214,13 +511,20 @@ export class GitHubReleaseCheckpointStorage {
       });
     }
     if (release.draft) {
-      const existingAssets = new Set((release.assets ?? []).map((asset) => asset.name));
-      if (!existingAssets.has(CHECKPOINT_DATABASE_FILE)) {
-        await this.uploadAsset(release.upload_url, CHECKPOINT_DATABASE_FILE, readFileSync(checkpoint.database_path), "application/vnd.sqlite3");
-      }
-      if (!existingAssets.has(CHECKPOINT_MANIFEST_FILE)) {
-        await this.uploadAsset(release.upload_url, CHECKPOINT_MANIFEST_FILE, readFileSync(checkpoint.manifest_path), "application/json");
-      }
+      await this.ensureDraftAsset(release, {
+        name: CHECKPOINT_DATABASE_FILE,
+        path: checkpoint.database_path,
+        contentType: "application/vnd.sqlite3",
+        size: checkpoint.manifest.database.bytes,
+        sha256: checkpoint.manifest.database.sha256,
+      });
+      await this.ensureDraftAsset(release, {
+        name: CHECKPOINT_MANIFEST_FILE,
+        path: checkpoint.manifest_path,
+        contentType: "application/json",
+        size: statSync(checkpoint.manifest_path).size,
+        sha256: checkpoint.manifest_sha256,
+      });
       release = await this.request(this.endpoint(`/releases/${release.id}`));
     }
     const verificationRoot = join(resolve(checkpoint.checkpoint_directory, "..", ".."), `.github-stage-verify-${randomUUID()}`);
