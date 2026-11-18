@@ -40,7 +40,7 @@ if (!Number.isInteger(collectionLimit) || collectionLimit < 1 || collectionLimit
   throw new Error(`--limit must be an integer from 1 to ${FIRST_CLOUD_MAX_SOURCES}`);
 }
 if (!Number.isInteger(collectionConcurrency) || collectionConcurrency < 1 || collectionConcurrency > 2) {
-  throw new Error("--concurrency must be 1 or 2 for the first cloud cohort");
+  throw new Error("--concurrency must be 1 or 2 for the bounded cloud cohort");
 }
 
 try {
@@ -55,11 +55,15 @@ try {
     workspacePath: workspace,
     protectedDatabasePaths: [resolve("data/jobs.sqlite")],
     generatedAt,
-    async collect({ databasePath, workspacePath }) {
+    async collect({ databasePath, workspacePath, generatedAt: selectionTime }) {
       const cohortDatabase = openStore(databasePath);
       let cohort;
       try {
-        cohort = selectCollectionCohort(cohortDatabase, { policy: cohortPolicy, limit: collectionLimit });
+        cohort = selectCollectionCohort(cohortDatabase, {
+          policy: cohortPolicy,
+          limit: collectionLimit,
+          selectionTime,
+        });
       } finally {
         cohortDatabase.close();
       }
@@ -87,10 +91,11 @@ try {
       if (attemptMetrics.max_attempts !== FIRST_CLOUD_MAX_HTTP_ATTEMPTS
         || attemptMetrics.attempts > FIRST_CLOUD_MAX_HTTP_ATTEMPTS
         || attemptMetrics.blocked_attempts !== 0) {
-        throw new Error("Bounded collector violated the first-cloud HTTP attempt policy");
+        throw new Error("Bounded collector violated the cloud HTTP attempt policy");
       }
       return {
         cohort_policy: cohortPolicy,
+        selection_time: selectionTime,
         limit: collectionLimit,
         concurrency: collectionConcurrency,
         source_ids_sha256: createHash("sha256")

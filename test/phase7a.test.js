@@ -118,7 +118,7 @@ test("GitHub transport and wrong repository failures remain closed and classifie
     (error) => error instanceof RemoteStorageError && error.code === "REMOTE_NOT_FOUND");
 });
 
-test("manual workflow has no schedule, no public data dependency, and fixed authority", () => {
+test("manual workflow uses rotating policy, immutable dispatch SHA, and fixed safety limits", () => {
   const workflow = readFileSync(resolve(".github/workflows/daily-collection.yml"), "utf8");
   assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /\bschedule:/);
@@ -127,9 +127,25 @@ test("manual workflow has no schedule, no public data dependency, and fixed auth
   assert.match(workflow, /repository techmap_job_checkpoints/);
   assert.match(workflow, /environment: checkpoint-production/);
   assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /--cohort-policy first_cloud_v1/);
+  assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
+  assert.doesNotMatch(workflow, /ref: main/);
+  assert.match(workflow, /--cohort-policy rotating_verified_v1/);
   assert.match(workflow, /--limit 5/);
   assert.match(workflow, /--concurrency 2/);
+  assert.doesNotMatch(workflow, /upload-pages|deploy-pages|upload-artifact|release upload/i);
   assert.match(workflow, /actions\/checkout@d23441a48e516b6c34aea4fa41551a30e30af803/);
   assert.match(workflow, /actions\/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38/);
+});
+
+test("cloud automation uses one fixed timestamp for rotating selection and checkpointing", () => {
+  const automation = readFileSync(resolve("scripts/phase6-automation.js"), "utf8");
+  assert.equal(automation.match(/new Date\(\)\.toISOString\(\)/g)?.length, 1);
+  assert.match(automation, /const generatedAt = new Date\(\)\.toISOString\(\)/);
+  assert.match(automation, /runCheckpointAutomation\(\{[\s\S]*?generatedAt,/);
+  assert.match(automation,
+    /async collect\(\{ databasePath, workspacePath, generatedAt: selectionTime \}\)/);
+  assert.match(automation,
+    /selectCollectionCohort\(cohortDatabase, \{[\s\S]*?policy: cohortPolicy,[\s\S]*?limit: collectionLimit,[\s\S]*?selectionTime,[\s\S]*?\}\)/);
+  assert.match(automation, /--max-http-attempts", FIRST_CLOUD_MAX_HTTP_ATTEMPTS/);
+  assert.match(automation, /selection_time: selectionTime/);
 });
