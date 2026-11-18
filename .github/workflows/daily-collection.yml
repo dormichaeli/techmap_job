@@ -43,9 +43,19 @@ jobs:
       - name: Run complete regression suite
         run: npm test
 
+      - name: Mint repository-scoped checkpoint write token
+        id: checkpoint-app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.CHECKPOINT_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CHECKPOINT_GITHUB_APP_PRIVATE_KEY }}
+          owner: dormichaeli
+          repositories: techmap_job_checkpoints
+          permission-contents: write
+
       - name: Restore, collect, checkpoint, verify, and promote
         env:
-          CHECKPOINT_REPOSITORY_TOKEN: ${{ secrets.CHECKPOINT_REPOSITORY_TOKEN }}
+          CHECKPOINT_REPOSITORY_TOKEN: ${{ steps.checkpoint-app-token.outputs.token }}
         run: >-
           node --disable-warning=ExperimentalWarning scripts/phase6-automation.js
           --owner dormichaeli

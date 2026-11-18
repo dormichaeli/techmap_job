@@ -137,6 +137,36 @@ test("manual workflow uses rotating policy, immutable dispatch SHA, and fixed sa
   assert.match(workflow, /actions\/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38/);
 });
 
+test("production workflow mints a fail-closed repository-scoped GitHub App write token", () => {
+  const workflow = readFileSync(resolve(".github/workflows/daily-collection.yml"), "utf8");
+  const tokenStep = workflow.indexOf("- name: Mint repository-scoped checkpoint write token");
+  const collectionStep = workflow.indexOf("- name: Restore, collect, checkpoint, verify, and promote");
+
+  assert.ok(tokenStep >= 0);
+  assert.ok(collectionStep > tokenStep);
+  assert.match(workflow,
+    /actions\/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510/);
+  assert.match(workflow, /id: checkpoint-app-token/);
+  assert.match(workflow, /client-id: \$\{\{ vars\.CHECKPOINT_GITHUB_APP_CLIENT_ID \}\}/);
+  assert.match(workflow, /private-key: \$\{\{ secrets\.CHECKPOINT_GITHUB_APP_PRIVATE_KEY \}\}/);
+  assert.match(workflow, /owner: dormichaeli/);
+  assert.match(workflow, /repositories: techmap_job_checkpoints/);
+  assert.match(workflow, /permission-contents: write/);
+  assert.match(workflow,
+    /permission-contents: write\s+\n\s*- name: Restore, collect, checkpoint, verify, and promote/);
+  assert.doesNotMatch(workflow, /permission-(?!contents: write)/);
+  assert.match(workflow,
+    /CHECKPOINT_REPOSITORY_TOKEN: \$\{\{ steps\.checkpoint-app-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(workflow, /secrets\.CHECKPOINT_REPOSITORY_TOKEN/);
+  assert.match(workflow, /--token-env CHECKPOINT_REPOSITORY_TOKEN/);
+  assert.doesNotMatch(workflow, /skip-token-revoke|continue-on-error|if:\s*always\(\)|--token\s/);
+  assert.equal(workflow.match(/CHECKPOINT_GITHUB_APP_PRIVATE_KEY/g)?.length, 1);
+  assert.equal(workflow.match(/steps\.checkpoint-app-token\.outputs\.token/g)?.length, 1);
+  assert.doesNotMatch(workflow, /echo.*(?:PRIVATE_KEY|outputs\.token)|print.*(?:PRIVATE_KEY|outputs\.token)/i);
+  assert.match(workflow, /timeout-minutes: 55/);
+  assert.doesNotMatch(workflow, /\bschedule:|\bpush:|pull_request:|workflow_run:|repository_dispatch:/);
+});
+
 test("cloud automation uses one fixed timestamp for rotating selection and checkpointing", () => {
   const automation = readFileSync(resolve("scripts/phase6-automation.js"), "utf8");
   assert.equal(automation.match(/new Date\(\)\.toISOString\(\)/g)?.length, 1);
