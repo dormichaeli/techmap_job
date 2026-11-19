@@ -1,8 +1,9 @@
-name: Daily job collection (manual readiness only)
+name: Daily job collection
 
-# Phase 6 deliberately has no schedule trigger. Add a reviewed off-peak cron only
-# after runtime, checkpoint repository, credentials, licensing, and bootstrap approval.
 on:
+  schedule:
+    - cron: "0 12 * * *"
+      timezone: "Asia/Jerusalem"
   workflow_dispatch:
 
 permissions:
@@ -14,13 +15,31 @@ concurrency:
 
 jobs:
   collect:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 55
-    environment: checkpoint-production
+    environment: ${{ github.event_name == 'schedule' && 'checkpoint-automation' || github.event_name == 'workflow_dispatch' && 'checkpoint-production' || 'checkpoint-denied' }}
     steps:
-      - name: Restrict authoritative runs to main
+      - name: Restrict authoritative events and runs
         shell: bash
+        env:
+          CHECKPOINT_AUTOMATION_ENABLED: ${{ vars.CHECKPOINT_AUTOMATION_ENABLED }}
         run: |
+          case "$GITHUB_EVENT_NAME" in
+            schedule)
+              if [[ "$CHECKPOINT_AUTOMATION_ENABLED" != "true" ]]; then
+                echo "::error::Scheduled collection requires an explicitly enabled checkpoint-automation environment."
+                exit 1
+              fi
+              ;;
+            workflow_dispatch)
+              ;;
+            *)
+              echo "::error::Unsupported authoritative collection event: $GITHUB_EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
           if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
             echo "::error::Authoritative collection is restricted to refs/heads/main."
             exit 1
