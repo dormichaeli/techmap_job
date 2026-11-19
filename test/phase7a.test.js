@@ -118,14 +118,36 @@ test("GitHub transport and wrong repository failures remain closed and classifie
     (error) => error instanceof RemoteStorageError && error.code === "REMOTE_NOT_FOUND");
 });
 
-test("manual workflow uses rotating policy, immutable dispatch SHA, and fixed safety limits", () => {
+test("scheduled and manual workflow paths use secure routing and fixed safety limits", () => {
   const workflow = readFileSync(resolve(".github/workflows/daily-collection.yml"), "utf8");
+  const eventGuard = workflow.indexOf("- name: Restrict authoritative events and runs");
+  const checkoutStep = workflow.indexOf("- name: Check out reviewed collector");
+  const tokenStep = workflow.indexOf("- name: Mint repository-scoped checkpoint write token");
+
   assert.match(workflow, /workflow_dispatch:/);
-  assert.doesNotMatch(workflow, /\bschedule:/);
+  assert.match(workflow,
+    /schedule:\s*\n\s*- cron: "0 12 \* \* \*"\s*\n\s*timezone: "Asia\/Jerusalem"/);
+  assert.equal(workflow.match(/\bschedule:/g)?.length, 1);
+  assert.equal(workflow.match(/\bworkflow_dispatch:/g)?.length, 1);
   assert.doesNotMatch(workflow, /\bqueue:/);
+  assert.doesNotMatch(workflow, /\bpush:|pull_request:|workflow_run:|repository_dispatch:/);
   assert.doesNotMatch(workflow, /data\/companies\.csv/);
   assert.match(workflow, /repository techmap_job_checkpoints/);
-  assert.match(workflow, /environment: checkpoint-production/);
+  assert.match(workflow,
+    /if: \$\{\{ github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch' \}\}/);
+  assert.match(workflow,
+    /environment: \$\{\{ github\.event_name == 'schedule' && 'checkpoint-automation' \|\| github\.event_name == 'workflow_dispatch' && 'checkpoint-production' \|\| 'checkpoint-denied' \}\}/);
+  assert.match(workflow, /CHECKPOINT_AUTOMATION_ENABLED: \$\{\{ vars\.CHECKPOINT_AUTOMATION_ENABLED \}\}/);
+  assert.match(workflow, /\[\[ "\$CHECKPOINT_AUTOMATION_ENABLED" != "true" \]\]/);
+  assert.match(workflow, /case "\$GITHUB_EVENT_NAME" in[\s\S]*?schedule\)[\s\S]*?workflow_dispatch\)[\s\S]*?\*\)/);
+  assert.match(workflow, /if \[\[ "\$GITHUB_REF" != "refs\/heads\/main" \]\]/);
+  assert.ok(eventGuard >= 0);
+  assert.ok(checkoutStep > eventGuard);
+  assert.ok(tokenStep > checkoutStep);
+  assert.match(workflow, /permissions:\s*\n\s*contents: read/);
+  assert.match(workflow, /group: techmap-job-authoritative-checkpoint/);
+  assert.match(workflow, /cancel-in-progress: false/);
+  assert.match(workflow, /run: npm test/);
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(workflow, /ref: main/);
@@ -164,7 +186,7 @@ test("production workflow mints a fail-closed repository-scoped GitHub App write
   assert.equal(workflow.match(/steps\.checkpoint-app-token\.outputs\.token/g)?.length, 1);
   assert.doesNotMatch(workflow, /echo.*(?:PRIVATE_KEY|outputs\.token)|print.*(?:PRIVATE_KEY|outputs\.token)/i);
   assert.match(workflow, /timeout-minutes: 55/);
-  assert.doesNotMatch(workflow, /\bschedule:|\bpush:|pull_request:|workflow_run:|repository_dispatch:/);
+  assert.doesNotMatch(workflow, /\bpush:|pull_request:|workflow_run:|repository_dispatch:/);
 });
 
 test("cloud automation uses one fixed timestamp for rotating selection and checkpointing", () => {
