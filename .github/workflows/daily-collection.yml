@@ -2,7 +2,7 @@ name: Daily job collection
 
 on:
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "17 12 * * *"
       timezone: "Asia/Jerusalem"
   workflow_dispatch:
 

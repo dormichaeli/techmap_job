@@ -126,7 +126,7 @@ test("scheduled and manual workflow paths use secure routing and fixed safety li
 
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow,
-    /schedule:\s*\n\s*- cron: "0 12 \* \* \*"\s*\n\s*timezone: "Asia\/Jerusalem"/);
+    /schedule:\s*\n\s*- cron: "17 12 \* \* \*"\s*\n\s*timezone: "Asia\/Jerusalem"/);
   assert.equal(workflow.match(/\bschedule:/g)?.length, 1);
   assert.equal(workflow.match(/\bworkflow_dispatch:/g)?.length, 1);
   assert.doesNotMatch(workflow, /\bqueue:/);
